@@ -8,11 +8,16 @@ import socket
 import psutil
 from datetime import datetime, timedelta
 from mcrcon import MCRcon
+from flask import Flask, render_template_string
+import threading
 
+# Discord bot setup
 intents = discord.Intents.default()
 intents.messages = True  # Subscribe to message events
 
 client = discord.Client(intents=intents)
+
+# Server and RCON configurations
 project8_exe_path = r'C:\Program Files (x86)\Steam\steamapps\common\Project8Staging\game\bin\win64\project8.exe'
 TOKEN = 
 SERVER_ADDRESS = 
@@ -20,12 +25,79 @@ RCON_PASSWORD =
 PORT_RANGE_START = 
 PORT_RANGE_END = 
 ADVERTISEMENT_CHANNEL_ID = 
+STEAMCMD_PATH = 'C:\\Program Files (x86)\\Steam\\steamcmd.exe' 
+APP_ID = 
 
 # Dictionary to store the process objects with their associated IDs (PIDs), ports, passwords, and creator IDs
 server_processes = {}
 
 # Dictionary to track the number of consecutive zero player statuses
 zero_player_counts = {}
+
+# Flask web server setup
+app = Flask(__name__)
+
+# HTML template for displaying server status
+status_template = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Server Status</title>
+</head>
+<body>
+    <h1>Active Servers</h1>
+    {% if servers %}
+    <ul>
+        {% for server in servers %}
+        <li>{{ server }}</li>
+        {% endfor %}
+    </ul>
+    {% else %}
+    <p>No active servers currently.</p>
+    {% endif %}
+</body>
+</html>
+"""
+
+# Flask route to display server status
+@app.route('/')
+def server_status():
+    active_servers = []
+    for pid, info in server_processes.items():
+        port = info['port']
+        try:
+            creator = client.get_user(info['creator_id'])
+            creator_name = creator.name if creator else "Unknown User"
+            with MCRcon('localhost', RCON_PASSWORD, port) as mcr:
+                response = mcr.command("status")
+                players = "unknown"
+                for line in response.splitlines():
+                    if "players  :" in line:
+                        players = int(line.split(":")[1].strip().split()[0])
+                        break
+                
+                if players < 12:
+                    connect_command = f"connect {SERVER_ADDRESS}:{port}; password {info['password']}"
+                else:
+                    connect_command = ""
+
+                server_info = f"ID: {pid}, Created by: {creator_name}, Players: {players}, Connect Command: {connect_command}"
+                active_servers.append(server_info)
+        except Exception as e:
+            print(f"Failed to get status for server with ID {pid}. Error: {e}")
+            creator_name = "Unknown User"
+            active_servers.append(f"ID: {pid}, Created by: {creator_name}, Players: unknown, Connect Command: Unknown")
+    
+    return render_template_string(status_template, servers=active_servers)
+
+
+# Function to run the Flask app in a separate thread
+def run_flask_app():
+    app.run(host='0.0.0.0', port=8080, debug=False)  # Change port if necessary
+
+# Thread to run Flask app alongside Discord bot
+flask_thread = threading.Thread(target=run_flask_app)
+flask_thread.start()
 
 def generate_random_password(length=10):
     """Generate a random password of given length consisting of digits."""
@@ -75,15 +147,6 @@ async def manage_server(pid, port, password):
         # Connect to RCON
         with MCRcon('localhost', RCON_PASSWORD, port) as mcr:
             print(f"Managing server with ID {pid}")
-
-            # Send initial commands
-            print(f"Sending initial command sv_cheats 1 to server with ID {pid}")
-            mcr.command("sv_cheats 1")
-            await asyncio.sleep(1)
-
-            print(f"Sending command host_timescale to server with ID {pid}")
-            mcr.command("host_timescale 0.1")
-            
             while True:
                 response = mcr.command("status")
                 players = 0
@@ -93,14 +156,12 @@ async def manage_server(pid, port, password):
                         break
 
                 if players >= 12:
-                    print(f"12 or more players detected on server with ID {pid}. Waiting 60s seconds to disable cheats.")
-                    await asyncio.sleep(60)  
-                    print(f"Sending command sv_cheats 0 to server with ID {pid}")
-                    mcr.command("sv_cheats 0")
-                    break
-
-                #mcr.command("trooper_kill_all")
-                await asyncio.sleep(10)  # Send trooper_kill_all every 10 seconds
+                    print(f"12 or more players detected on server with ID {pid}. Waiting 60 seconds to disable cheats.")
+                    await asyncio.sleep(30)  
+                    print(f"Sending command changelevel ID {pid}")
+                    mcr.command("changelevel street_test")
+                    break              
+                await asyncio.sleep(20) 
 
     except Exception as e:
         print(f"Failed to manage server with ID {pid}. Error: {e}")
@@ -131,7 +192,14 @@ def start_server(port, password):
     # Return the process ID
     return pid
 
-
+async def add_temporary_player(pid):
+    """Add a temporary player to the count for the specified server ID."""
+    temporary_players[pid] = temporary_players.get(pid, 0) + 1
+    await asyncio.sleep(30)  # Remove the temporary player count after 30 seconds
+    if pid in temporary_players:
+        temporary_players[pid] -= 1
+        if temporary_players[pid] == 0:
+            del temporary_players[pid]
 
 async def send_help_message(channel):
     """Send a help message to the specified channel."""
@@ -183,45 +251,67 @@ async def send_rcon_command(pid, command, message):
         print(f"Invalid server ID: {pid} or unauthorized user.")
         await message.author.send("Invalid server ID or unauthorized user.")
 
+async def steamcmd_update():
+    """Run SteamCMD to check and update the game before starting server checks."""
+    process = await asyncio.create_subprocess_exec(
+        STEAMCMD_PATH, '+login', 'anonymous', '+app_update', str(APP_ID), '+quit',
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    
+    stdout, stderr = await process.communicate()
+    
+    if process.returncode == 0:
+        print("SteamCMD update check completed successfully.")
+        print(stdout.decode())
+    else:
+        print("SteamCMD update check failed.")
+        print(stderr.decode())
+        
 async def check_server_status():
     """Check the status of all active servers and kill any that have no players three times in a row."""
     loop = asyncio.get_event_loop()
-    
+
     while True:
-        for pid, info in list(server_processes.items()):
-            port = info['port']
-            # Check if the process with pid exists
-            if not psutil.pid_exists(pid):
-                print(f"Server with ID {pid} has been killed externally.")
-                del server_processes[pid]
-                if pid in zero_player_counts:
-                    del zero_player_counts[pid]
-                continue
+        if not server_processes:
+            print("No active servers found. Running SteamCMD update.")
+            await steamcmd_update()
+        else:
+            for pid, info in list(server_processes.items()):
+                port = info['port']
+                # Check if the process with pid exists
+                if not psutil.pid_exists(pid):
+                    print(f"Server with ID {pid} has been killed externally.")
+                    del server_processes[pid]
+                    if pid in zero_player_counts:
+                        del zero_player_counts[pid]
+                    continue
 
-            try:
-                print(f"Checking server status for PID {pid} on port {port}")
-                with MCRcon('localhost', RCON_PASSWORD, port) as mcr:
-                    response = await loop.run_in_executor(None, mcr.command, "status")
-                    print(f"RCON status response for server ID {pid}: {response}")
-                    if "players  : 0 humans" in response:
-                        zero_player_counts[pid] = zero_player_counts.get(pid, 0) + 1
-                        print(f"Server with ID {pid} is found to be idle. Zero player count: {zero_player_counts[pid]}")
-                    else:
-                        zero_player_counts[pid] = 0
-                        print(f"Server with ID {pid} is not idle. Players are present.")
-                    
-                    if zero_player_counts[pid] >= 3:
-                        await kill_process(pid)
-                        print(f"Server with ID {pid} has been idle for too long and has been killed.")
-                    
-                    if "Game State: 6" in response:
-                        await kill_process(pid)
-                        print(f"Server with ID {pid} is in an invalid game state and has been killed.")
-            except Exception as e:
-                print(f"Failed to check status for server with ID {pid}. Error: {e}")
-        await asyncio.sleep(500)  # Wait X
+                try:
+                    print(f"Checking server status for PID {pid} on port {port}")
+                    with MCRcon('localhost', RCON_PASSWORD, port) as mcr:
+                        response = await loop.run_in_executor(None, mcr.command, "status")
+                        print(f"RCON status response for server ID {pid}: {response}")
+                        if "players  : 0 humans" in response:
+                            zero_player_counts[pid] = zero_player_counts.get(pid, 0) + 1
+                            print(f"Server with ID {pid} is found to be idle. Zero player count: {zero_player_counts[pid]}")
+                        else:
+                            zero_player_counts[pid] = 0
+                            print(f"Server with ID {pid} is not idle. Players are present.")
+                        
+                        if zero_player_counts[pid] >= 3:
+                            await kill_process(pid)
+                            print(f"Server with ID {pid} has been idle for too long and has been killed.")
+                        
+                        if "Game State: 6" in response:
+                            await kill_process(pid)
+                            print(f"Server with ID {pid} is in an invalid game state and has been killed.")
+                except Exception as e:
+                    print(f"Failed to check status for server with ID {pid}. Error: {e}")
+        await asyncio.sleep(500)  # Wait X seconds before checking again
 
-
+# Run the check_server_status function in the event loop
+async def main(steamcmd_path, app_id):
+    await check_server_status(steamcmd_path, app_id)
 
 async def handle_ss_command(message):
     """Handle the 'SS' command to start a new server."""
@@ -236,6 +326,7 @@ async def handle_ss_command(message):
     # Send the connection information to the user
     response = (
         f"!THIS SERVER WILL BE KILLED IF EMPTY FOR 10 MINUTES JOIN NOW!\n"
+        f"Pause the game once inside to allow people to join in. Reset in case of any issue.\n"
         f"Server ID: {pid}\n"
         f"{SERVER_ADDRESS}:{port}\n"
         f"{password}\n"
@@ -309,7 +400,10 @@ async def handle_join_command(pid, message):
                         f"```\nconnect {SERVER_ADDRESS}:{port}; password {password}\n```\n"
                     )
                     await message.author.send(response_message)
-                    await message.author.send(f'To receive the connection information for this server, type:\n```@terminal join {pid}```')
+                    
+                    # Add a temporary player count
+                    asyncio.create_task(add_temporary_player(pid))
+                    
                 else:
                     await message.author.send("Server is full (12 players).")
         except Exception as e:
@@ -377,10 +471,7 @@ async def advertise_active_servers(channel):
         except Exception as e:
             print(f"Unexpected error in advertise_active_servers: {e}")
 
-
-
-
-
+# Run the Discord bot
 @client.event
 async def on_ready():
     print(f'Logged in as {client.user}')
